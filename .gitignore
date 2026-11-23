@@ -1,0 +1,17 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Archivos de datos crudos pesados
+data/raw/
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# IDEs y editores
+.vscode/
+.idea/
+
