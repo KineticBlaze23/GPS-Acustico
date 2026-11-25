@@ -134,7 +134,7 @@ picos_y = []
 for p in indices_picos:
     ini = max(0, p - ventana)
     fin = min(len(senal), p + ventana)
-    local_idx = ini + np.argmax(np.abs(senal[ini:fin]))
+    local_idx = ini + np.argmax(senal[ini:fin])
     picos_y.append(senal[local_idx])
 
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(13, 8), sharex=True)
