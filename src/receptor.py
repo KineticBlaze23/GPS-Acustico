@@ -58,8 +58,21 @@ muestras_np = np.array(todas_las_muestras, dtype=np.float64)
 timestamps_np = np.array(timestamps_bloques, dtype=np.int64)
 conteos_np = np.array(conteo_muestras, dtype=np.int64)
 
-tiempo_total_s = (timestamps_np[-1] - timestamps_np[0]) * 1e-6
-fs_real = np.sum(conteos_np[1:]) / tiempo_total_s
+# Cálculo y validación de la frecuencia de muestreo real
+tiempo_total_s = (timestamps_np[-1] - timestamps_np[0]) * 1e-6 if len(timestamps_np) > 1 else 0
+if tiempo_total_s > 0:
+    fs_calculada = np.sum(conteos_np[1:]) / tiempo_total_s
+else:
+    fs_calculada = 40000.0
+
+# El hardware I2S del ESP32 está configurado físicamente a 40,000 Hz.
+# Si el cálculo por timestamps presenta discontinuidades (+/- 2.5%), se fija a 40,000 Hz.
+if 39000.0 <= fs_calculada <= 41000.0:
+    fs_real = fs_calculada
+else:
+    print(f"AVISO: Discontinuidad en timestamps ({fs_calculada:.1f} Hz). Fijando fs_real nominal a 40000.0 Hz.")
+    fs_real = 40000.0
+
 voltaje = (muestras_np / 4095.0) * 3.3
 tiempo_s = np.arange(len(voltaje)) / fs_real
 

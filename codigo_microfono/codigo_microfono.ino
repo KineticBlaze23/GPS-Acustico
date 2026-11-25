@@ -1,45 +1,68 @@
 #include <Arduino.h>
+#include <Wire.h>
 #include <driver/i2s.h>
-#include "esp_timer.h"
 
-// Pines GPIO impresos en la placa ESP32-S3
-#define I2S_WS            10  // LRCLK (impreso como 10 en la placa)
-#define I2S_SCK           47  // BCLK  (impreso como 47 en la placa)
-#define I2S_SD            21  // DOUT  (impreso como 21 en la placa)
+// --- PINES MICRÓFONO INMP441 (I2S) ---
+#define I2S_WS   10
+#define I2S_SCK  47
+#define I2S_SD   21
+#define I2S_PORT I2S_NUM_0
 
-#define I2S_PORT          I2S_NUM_0
-#define SAMPLE_RATE_HZ    40000
-#define SAMPLES_PER_FRAME 256
+// --- PINES RELOJ EXTERNO DS3231 (TCXO) ---
+#define DS_SDA      8
+#define DS_SCL      9
+#define DS_SQW      11
+#define DS3231_ADDR 0x68
 
-int32_t bufferI2S[SAMPLES_PER_FRAME];
+// --- PARÁMETROS DE MUESTREO Y PROTOCOLO ---
+#define SAMPLE_RATE    40000
+#define BUFFER_SAMPLES 512
 
-#pragma pack(push, 1)
-struct PaqueteAudio {
-  uint8_t header[4];
-  int64_t timestamp_us;
-  uint16_t num_muestras;
-  uint16_t muestras[SAMPLES_PER_FRAME];
-};
-#pragma pack(pop)
+const uint8_t HEADER[4] = {0xAA, 0x55, 0xAA, 0x55};
+int32_t  i2s_raw_buf[BUFFER_SAMPLES];
+uint16_t tx_buf[BUFFER_SAMPLES];
 
-PaqueteAudio paquete;
+// Variables de sincronización con el pulso exacto de 1.000000 Hz del DS3231
+volatile uint32_t ds3231_segundos = 0;
+volatile uint64_t ds3231_ultimo_flanco_us = 0;
+volatile uint64_t ds3231_periodo_real_us = 1000000ULL;
 
-void configurarI2S() {
-  const i2s_config_t i2s_config = {
+void IRAM_ATTR isr_ds3231_sqw() {
+  uint64_t ahora = esp_timer_get_time();
+  if (ds3231_segundos > 0) {
+    ds3231_periodo_real_us = ahora - ds3231_ultimo_flanco_us;
+  }
+  ds3231_ultimo_flanco_us = ahora;
+  ds3231_segundos++;
+}
+
+void configurar_ds3231_1hz() {
+  Wire.begin(DS_SDA, DS_SCL);
+  Wire.beginTransmission(DS3231_ADDR);
+  Wire.write(0x0E);       // Registro de control
+  Wire.write(0b00000000); // INTCN=0, RS2=0, RS1=0 -> Salida cuadrada 1 Hz en SQW
+  Wire.endTransmission();
+
+  pinMode(DS_SQW, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(DS_SQW), isr_ds3231_sqw, FALLING);
+}
+
+void configurar_i2s() {
+  i2s_config_t i2s_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-    .sample_rate = SAMPLE_RATE_HZ,
+    .sample_rate = SAMPLE_RATE,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count = 8,
-    .dma_buf_len = SAMPLES_PER_FRAME,
-    .use_apll = false,
+    .dma_buf_len = BUFFER_SAMPLES,
+    .use_apll = true,
     .tx_desc_auto_clear = false,
     .fixed_mclk = 0
   };
 
-  const i2s_pin_config_t pin_config = {
+  i2s_pin_config_t pin_config = {
     .bck_io_num = I2S_SCK,
     .ws_io_num = I2S_WS,
     .data_out_num = I2S_PIN_NO_CHANGE,
@@ -52,35 +75,45 @@ void configurarI2S() {
 }
 
 void setup() {
-  paquete.header[0] = 0xAA;
-  paquete.header[1] = 0x55;
-  paquete.header[2] = 0xAA;
-  paquete.header[3] = 0x55;
-
   Serial.begin(2000000);
-  delay(1000);
-  configurarI2S();
+  configurar_ds3231_1hz();
+  configurar_i2s();
 }
 
 void loop() {
-  size_t bytesLeidos = 0;
+  size_t bytes_leidos = 0;
+  esp_err_t res = i2s_read(I2S_PORT, i2s_raw_buf, sizeof(i2s_raw_buf), &bytes_leidos, portMAX_DELAY);
 
-  if (i2s_read(I2S_PORT, &bufferI2S, sizeof(bufferI2S), &bytesLeidos, portMAX_DELAY) == ESP_OK) {
-    paquete.timestamp_us = esp_timer_get_time();
-    uint32_t n = bytesLeidos / sizeof(int32_t);
-    if (n > SAMPLES_PER_FRAME) n = SAMPLES_PER_FRAME;
-    paquete.num_muestras = (uint16_t)n;
+  if (res == ESP_OK && bytes_leidos > 0) {
+    uint16_t num_muestras = bytes_leidos / sizeof(int32_t);
+    uint64_t ts_esp_us = esp_timer_get_time();
 
-    for (uint32_t i = 0; i < n; i++) {
-      // Escala los 24 bits con signo del INMP441 al rango 0..4095 (centro 2048)
-      int32_t muestra = bufferI2S[i] >> 14;
-      int32_t escalado = muestra + 2048;
-      if (escalado < 0) escalado = 0;
-      if (escalado > 4095) escalado = 4095;
-      paquete.muestras[i] = (uint16_t)escalado;
+    // Disciplinar el timestamp interno usando el periodo medido contra el DS3231
+    noInterrupts();
+    uint32_t seg_ext = ds3231_segundos;
+    uint64_t t_ref_us = ds3231_ultimo_flanco_us;
+    uint64_t periodo_us = ds3231_periodo_real_us;
+    interrupts();
+
+    int64_t ts_corregido_us;
+    if (seg_ext > 0 && periodo_us > 900000ULL && periodo_us < 1100000ULL) {
+      double fraccion_seg = (double)(ts_esp_us - t_ref_us) / (double)periodo_us;
+      ts_corregido_us = (int64_t)(seg_ext * 1000000ULL) + (int64_t)(fraccion_seg * 1000000.0);
+    } else {
+      ts_corregido_us = (int64_t)ts_esp_us;
     }
 
-    size_t bytesAEnviar = 4 + 8 + 2 + (n * sizeof(uint16_t));
-    Serial.write((uint8_t *)&paquete, bytesAEnviar);
+    for (uint16_t i = 0; i < num_muestras; i++) {
+      int32_t val = (i2s_raw_buf[i] >> 16) + 2048;
+      if (val < 0) val = 0;
+      if (val > 4095) val = 4095;
+      tx_buf[i] = (uint16_t)val;
+    }
+
+    // Enviar trama binaria compatible con receptor.py
+    Serial.write(HEADER, 4);
+    Serial.write((uint8_t*)&ts_corregido_us, sizeof(ts_corregido_us));
+    Serial.write((uint8_t*)&num_muestras, sizeof(num_muestras));
+    Serial.write((uint8_t*)tx_buf, num_muestras * sizeof(uint16_t));
   }
 }

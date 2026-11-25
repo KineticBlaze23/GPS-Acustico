@@ -13,9 +13,9 @@ GPS Acustico/
 ├── data/
 │   ├── processed/                # Señales procesadas y plantillas de correlación (.npz)
 │   ├── raw/                      # Grabaciones crudas en formato .npz y .wav (ignorado en git)
-│   └── senales_referencia/       # Audio generado para reproducción (.wav)
+│   ├── senales_referencia/       # Audio generado para reproducción (.wav)
 ├── src/
-│   ├── generar_senales.py        # Generación de señales chirp y pulsos de prueba
+│   ├── generar_senales.py        # Generación de pulso percusivo de alta potencia (2.5 kHz, 20 ms) cada 2 s
 │   ├── procesar_posicion.py      # Algoritmo de correlación, ToF y estimación de distancia
 │   └── receptor.py               # Captura de datos vía puerto serial desde el ESP32-S3
 └── tests/
@@ -53,7 +53,7 @@ pip install numpy scipy matplotlib pyserial
 ## Flujo de Trabajo
 
 1. **Generación de señales de referencia:**
-   Ejecutar `src/generar_senales.py` para generar los archivos de audio estéreo (`data/senales_referencia/senal_chirp.wav` y `senal_pulso.wav`) junto con la plantilla de correlación (`data/processed/plantillas_senales.npz`).
+   Ejecutar `src/generar_senales.py` para generar el archivo de audio unificado tipo chasquido (`data/senales_referencia/senal_pulso.wav`) junto con la plantilla de correlación (`data/processed/plantillas_senales.npz`).
    ```bash
    python src/generar_senales.py
    ```
