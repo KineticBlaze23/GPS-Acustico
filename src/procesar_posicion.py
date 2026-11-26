@@ -1,206 +1,218 @@
+from fractions import Fraction
 from pathlib import Path
-import numpy as np
+
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
-from scipy.signal import find_peaks
+import numpy as np
+from scipy.interpolate import CubicSpline
+from scipy.optimize import root_scalar
+from scipy.signal import butter, filtfilt, fftconvolve, find_peaks, hilbert, resample_poly
 
-# Definición de rutas basadas en la raíz del proyecto
+# ----------------------------------------------------------------------------
+# RUTAS (basadas en la raíz del proyecto)
+# ----------------------------------------------------------------------------
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DIR_PROCESSED = ROOT_DIR / "data" / "processed"
 DIR_RAW = ROOT_DIR / "data" / "raw"
-
 DIR_PROCESSED.mkdir(parents=True, exist_ok=True)
 
 ARCHIVO_GRABACION = DIR_RAW / "grabacion_cruda.npz"
 ARCHIVO_PLANTILLAS = DIR_PROCESSED / "plantillas_senales.npz"
 ARCHIVO_EVIDENCIA = DIR_PROCESSED / "evidencia_posicion_acustica.png"
 
-# --- PARÁMETROS FÍSICOS Y DE EMISIÓN ---
-C_SONIDO = 343.0          # Velocidad del sonido en el aire [m/s] a 20 °C
-PERIODO_WAV = 2.0         # Intervalo nominal entre emisiones acústicas [s]
+# ----------------------------------------------------------------------------
+# PARÁMETROS (mismos que validar_posiciones.py para que coincidan al 100 %)
+# ----------------------------------------------------------------------------
+TEMP_C = 20.0               # Temperatura ambiente [°C]
+N_QUIETO = 5                # Pulsos iniciales con el micrófono INMÓVIL (calibración de reloj)
+FS_NOMINAL = 40000          # Frecuencia nominal del firmware [Hz]
+PERIODO_WAV = 2.0           # Periodo entre emisiones [s] (se lee de la plantilla)
+C_SONIDO = 331.3 + 0.606 * TEMP_C
 
-# 1. Cargar grabación capturada por el micrófono
+# ----------------------------------------------------------------------------
+# 1. CARGAR GRABACIÓN Y FILTRAR RUIDO DE BAJA FRECUENCIA
+# ----------------------------------------------------------------------------
 if not ARCHIVO_GRABACION.exists():
-    print(f"ERROR: No se encontró el archivo de grabación en {ARCHIVO_GRABACION}")
-    exit(1)
+    raise SystemExit(f"ERROR: No se encontró {ARCHIVO_GRABACION}")
 
 datos = np.load(ARCHIVO_GRABACION)
+if 'fs_real' not in datos:
+    raise SystemExit("ERROR: la grabación no trae 'fs_real'.")
 voltaje = datos['voltaje']
-fs_guardada = float(datos['fs_real']) if 'fs_real' in datos else 40000.0
+fs_real = float(datos['fs_real'])
 
-# Validación de la frecuencia de muestreo de hardware
-if 39000.0 <= fs_guardada <= 41000.0:
-    fs_real = fs_guardada
-else:
-    fs_real = 40000.0
+senal_cruda = voltaje - np.mean(voltaje)
+tiempo_s = np.arange(len(senal_cruda)) / fs_real
 
-senal = voltaje - np.mean(voltaje)
-tiempo_s = np.arange(len(senal)) / fs_real
+# Filtro pasa-banda (1.5 kHz - 6.5 kHz): elimina el ruido lento que tapaba P18-P29
+nyq = 0.5 * fs_real
+b_filt, a_filt = butter(4, [1500.0 / nyq, 6500.0 / nyq], btype='band')
+senal = filtfilt(b_filt, a_filt, senal_cruda)
 
-# 2. Cargar plantilla del pulso de referencia para correlación cruzada
+# ----------------------------------------------------------------------------
+# 2. CARGAR PLANTILLA Y REMUESTREAR CON FILTRO ANTI-ALIAS
+# ----------------------------------------------------------------------------
 if not ARCHIVO_PLANTILLAS.exists():
-    print(f"ERROR: No se encontró el archivo de plantilla en {ARCHIVO_PLANTILLAS}")
-    exit(1)
+    raise SystemExit(f"ERROR: No se encontró {ARCHIVO_PLANTILLAS}")
 
 plantillas = np.load(ARCHIVO_PLANTILLAS)
 fs_audio = float(plantillas['fs_audio'])
-plantilla_orig = plantillas['pulso']
 if 'periodo' in plantillas:
     PERIODO_WAV = float(plantillas['periodo'])
 
-# Adaptar plantilla a la frecuencia de muestreo real del micrófono
-t_orig = np.arange(len(plantilla_orig)) / fs_audio
-t_nuevo = np.arange(0, t_orig[-1], 1.0 / fs_real)
-plantilla = np.interp(t_nuevo, t_orig, plantilla_orig)
+r = Fraction(int(round(FS_NOMINAL)), int(round(fs_audio))).limit_denominator(2000)
+plantilla = resample_poly(plantillas['pulso'], r.numerator, r.denominator)
+plantilla = filtfilt(b_filt, a_filt, plantilla)  # Mismo filtrado a la plantilla
+plantilla = plantilla / np.linalg.norm(plantilla)
 
-# 3. Correlación cruzada (Filtro Adaptado para máxima precisión de ToA)
-corr = np.abs(np.convolve(senal, plantilla[::-1], mode='valid'))
-
+# ----------------------------------------------------------------------------
+# 3. FILTRO ADAPTADO + DETECCIÓN INICIAL EN REPOSO (N_QUIETO)
+# ----------------------------------------------------------------------------
+corr = np.abs(hilbert(fftconvolve(senal, plantilla[::-1], mode='valid')))
 piso_ruido = np.median(corr)
-umbral_pico = max(3.5 * piso_ruido, 0.08 * np.max(corr))
+umbral_ruido = 6.0 * piso_ruido
 dist_min_muestras = int(0.70 * PERIODO_WAV * fs_real)
 
-indices_picos, _ = find_peaks(corr, height=umbral_pico, distance=dist_min_muestras)
+# Detectar los primeros pulsos fuertes en reposo para calibrar el paso exacto
+indices_init, _ = find_peaks(corr, height=max(umbral_ruido, 0.25 * np.max(corr)),
+                             distance=dist_min_muestras)
 
-# Descartar último pico si quedó truncado al apagarse la grabación
-if len(indices_picos) > 1 and (indices_picos[-1] - indices_picos[-2]) < int(0.75 * PERIODO_WAV * fs_real):
-    indices_picos = indices_picos[:-1]
+if len(indices_init) < N_QUIETO:
+    raise SystemExit("ERROR: no se detectaron suficientes pulsos iniciales en reposo.")
 
-if len(indices_picos) == 0:
-    print("ERROR: No se detectaron pulsos acústicos válidos en la grabación.")
-    exit(1)
+def estimar_pico_spline(y, idx_max, fs):
+    ini = max(0, idx_max - 4)
+    fin = min(len(y), idx_max + 5)
+    ventana = np.arange(ini, fin)
+    t_v = ventana / fs
+    cs = CubicSpline(t_v, y[ventana])
+    try:
+        res = root_scalar(cs.derivative(), bracket=[t_v[1], t_v[-2]], method='brentq')
+        return res.root
+    except ValueError:
+        return idx_max / fs
 
-# 4. Estimación de Tiempo de Llegada (ToA) con Interpolación Parabólica Sub-muestra
-picos_sub = []
-for p in indices_picos:
-    if 0 < p < len(corr) - 1:
-        y1, y2, y3 = corr[p - 1], corr[p], corr[p + 1]
-        delta = (y1 - y3) / (2 * (y1 - 2 * y2 + y3) + 1e-12)
-        picos_sub.append(p + np.clip(delta, -0.5, 0.5))
-    else:
-        picos_sub.append(float(p))
-picos_sub = np.array(picos_sub)
+# Calibrar periodo exacto del emisor (a) y origen (b) con los N_QUIETO primeros pulsos
+t_cal = np.array([estimar_pico_spline(corr, p, fs_real) for p in indices_init[:N_QUIETO]])
+c_cal = np.round((t_cal - t_cal[0]) / PERIODO_WAV).astype(int)
+a, b = np.polyfit(c_cal, t_cal, 1)
 
-tiempos = picos_sub / fs_real
+# ----------------------------------------------------------------------------
+# 4. RASTREO FÍSICO CONTINUO (BLOQUEA ECOS LEJANOS COMO EL DE +226 CM)
+# ----------------------------------------------------------------------------
+paso_muestras = a * fs_real
+ventana_tracking = int(0.0045 * fs_real)  # ±4.5 ms (±154 cm máx entre pulsos, excluye el eco de +6.6 ms)
+radio_frente = int(0.003 * fs_real)       # 3 ms hacia atrás para tomar el primer frente directo
 
-# 5. Cálculo de Posición Acústica Pura (Sin referencias iniciales manuales)
-# El primer pulso recibido establece el origen acústico de la medición (d_1 = 0.00 cm)
-t_origen = tiempos[0]
-ciclos = np.arange(len(tiempos))
-tiempos_esperados = t_origen + ciclos * PERIODO_WAV
+indices_picos = list(indices_init[:N_QUIETO])
+ciclos = list(c_cal)
 
-# Desplazamiento acústico respecto al origen inicial: delta_t * c
-delta_t = tiempos - tiempos_esperados
-desplazamiento_m = delta_t * C_SONIDO
+ciclo_actual = ciclos[-1]
+idx_actual = indices_picos[-1]
 
-# Todas las distancias en centímetros y positivas (>= 0.00 cm)
-distancias_cm = np.maximum(0.0, desplazamiento_m * 100.0)
+while True:
+    ciclo_siguiente = ciclo_actual + 1
+    centro = int(round(idx_actual + paso_muestras))
+    ini = centro - ventana_tracking
+    fin = centro + ventana_tracking
+    if fin >= len(corr):
+        break
 
-# 6. Estadísticas y Error Teórico de Métodos Numéricos
-distancia_final_cm = float(distancias_cm[-1])
-tiempo_final_s = float(tiempos[-1])
+    seg = corr[ini:fin]
+    max_local = np.max(seg)
 
-# Error teórico de discretización espacial a fs: e = c / (2 * fs)
+    if max_local >= umbral_ruido:
+        # Buscar el máximo local dentro de la ventana física y priorizar su borde delantero
+        idx_max_loc = ini + int(np.argmax(seg))
+        ini_f = max(ini, idx_max_loc - radio_frente)
+        sub_picos, _ = find_peaks(corr[ini_f:idx_max_loc + 1], height=max(umbral_ruido, 0.35 * max_local))
+        idx_encontrado = ini_f + sub_picos[0] if len(sub_picos) > 0 else idx_max_loc
+
+        indices_picos.append(idx_encontrado)
+        ciclos.append(ciclo_siguiente)
+        idx_actual = idx_encontrado
+
+    ciclo_actual = ciclo_siguiente
+
+indices_picos = np.array(indices_picos)
+ciclos = np.array(ciclos)
+
+# ----------------------------------------------------------------------------
+# 5. TIEMPOS SUB-MUESTRA Y DESPLAZAMIENTO RESPECTO AL ORIGEN
+# ----------------------------------------------------------------------------
+tiempos = np.array([estimar_pico_spline(corr, p, fs_real) for p in indices_picos])
+delta_t = tiempos - (a * ciclos + b)
+distancias_cm = delta_t * C_SONIDO * 100.0
+
+n_cal = N_QUIETO
 error_teorico_cm = float((C_SONIDO / (2.0 * fs_real)) * 100.0)
-
-# --- REPORTE CONSOLA LIMPIO Y CLARO ---
-print("\n" + "=" * 55)
+deriva_ppm = (a / PERIODO_WAV - 1.0) * 1e6
+# ----------------------------------------------------------------------------
+# 6. REPORTE EN CONSOLA
+# ----------------------------------------------------------------------------
+print("\n" + "=" * 58)
 print("          MEDICIÓN DE POSICIÓN ACÚSTICA (1D)")
-print("=" * 55)
-print(f"Total de pulsos acústicos medidos: {len(distancias_cm)}\n")
+print("=" * 58)
+print(f"fs_real (DS3231):     {fs_real:.2f} Hz | c = {C_SONIDO:.1f} m/s")
+print(f"Deriva del emisor:    {deriva_ppm:+.1f} ppm (calibrado con {n_cal} pulsos)")
+print(f"Límite teórico:       ±{error_teorico_cm:.2f} cm\n")
 
-print(f"{'Pulso':<12} {'Tiempo (s)':<18} {'Distancia (cm)':<18}")
-print("-" * 50)
+print(f"{'Pulso':<8}{'Ciclo':<8}{'Tiempo (s)':<14}{'Posición (cm)':<14}")
+print("-" * 44)
+for k in range(len(tiempos)):
+    tag = " (cal)" if k < n_cal else ""
+    print(f"{k+1:<8}{ciclos[k]:<8}{tiempos[k]:<14.4f}{distancias_cm[k]:<14.2f}{tag}")
+print("-" * 44)
+print(f"Posición final medida: {distancias_cm[-1]:.2f} cm")
+print("=" * 58 + "\n")
 
-for k in range(len(distancias_cm)):
-    print(f"Pulso {k+1:<5}   t = {tiempos[k]:5.2f} s           {distancias_cm[k]:6.2f} cm")
-
-print("-" * 50)
-print(f"Distancia final (t = {tiempo_final_s:.2f} s):   {distancia_final_cm:.2f} cm")
-print(f"Error teórico de medición:       ±{error_teorico_cm:.2f} cm")
-rango_min = max(0.0, distancia_final_cm - error_teorico_cm)
-rango_max = distancia_final_cm + error_teorico_cm
-print(f"Rango aceptable esperado:        [{rango_min:.2f} cm , {rango_max:.2f} cm]")
-print("=" * 55 + "\n")
-
-# --- GRÁFICAS DE EVIDENCIA (20 SEGUNDOS COMPLETOS, EJES CADA 2s Y CADA 1s) ---
-duracion_total = int(np.ceil(tiempo_s[-1])) if len(tiempo_s) > 0 else 20
-max_x = max(20, duracion_total)
-y_max = np.max(np.abs(senal))
-
-# Encontrar el pico de oscilación en la onda real para el punto rojo
-ventana = int(0.010 * fs_real)
-picos_y = []
-for p in indices_picos:
-    ini = max(0, p - ventana)
-    fin = min(len(senal), p + ventana)
-    local_idx = ini + np.argmax(senal[ini:fin])
-    picos_y.append(senal[local_idx])
+# ----------------------------------------------------------------------------
+# 7. GRÁFICAS DE EVIDENCIA
+# ----------------------------------------------------------------------------
+max_x = max(20, int(np.ceil(tiempo_s[-1])))
+y_max = float(np.max(np.abs(senal)))
 
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(13, 8), sharex=True)
 
-# Panel 1: Señal Acústica Completa en el Dominio del Tiempo
-ax1.plot(tiempo_s, senal, color='#2c3e50', linewidth=0.6, label='Audio capturado [V]')
-ax1.plot(tiempos, picos_y, 'ro', markersize=6, label='Pulsos detectados')
-ax1.set_ylim(-1.5 * y_max, 1.65 * y_max)
+# Panel 1: Onda filtrada y pulsos detectados
+ax1.plot(tiempo_s, senal, color='#2c3e50', linewidth=0.6, label='Audio filtrado (1.5 - 6.5 kHz)')
+for k, (p, t) in enumerate(zip(indices_picos, tiempos)):
+    ini_v = max(0, p - int(0.01 * fs_real))
+    fin_v = min(len(senal), p + int(0.01 * fs_real))
+    pico_vis = senal[ini_v + np.argmax(np.abs(senal[ini_v:fin_v]))]
+    ax1.plot(t, pico_vis, 'ro', markersize=5)
+    ax1.annotate(f"P{k+1}", xy=(t, pico_vis), xytext=(0, 8), textcoords="offset points",
+                 ha='center', fontsize=8, fontweight='bold', color='#900C3F')
 
-# Evidenciar cada pulso con su etiqueta en el Panel 1
-for k, t in enumerate(tiempos):
-    ax1.annotate(
-        f"P{k+1} ({t:.2f}s)",
-        xy=(t, picos_y[k]),
-        xytext=(t, 1.35 * y_max),
-        textcoords='data',
-        ha='center',
-        va='center',
-        fontsize=8,
-        fontweight='bold',
-        color='#900C3F',
-        arrowprops=dict(arrowstyle='->', color='#C70039', lw=1.0, alpha=0.7),
-        bbox=dict(boxstyle='round,pad=0.25', facecolor='#FDEDEC', edgecolor='#C70039', alpha=0.9)
-    )
-
-ax1.set_title(f"1. Señal Acústica Completa (0 a {max_x} s @ {fs_real:.1f} Hz)", fontsize=11, fontweight='bold')
-ax1.set_ylabel("Amplitud [V]", fontsize=10)
+ax1.set_ylim(-1.3 * y_max, 1.3 * y_max)
+ax1.set_title(f"1. Señal acústica filtrada y detecciones (0 a {max_x} s @ {fs_real:.1f} Hz)",
+              fontsize=11, fontweight='bold')
+ax1.set_ylabel("Amplitud filtrada")
 ax1.set_xlim(0, max_x)
-ax1.xaxis.set_major_locator(ticker.MultipleLocator(2.0))
-ax1.xaxis.set_minor_locator(ticker.MultipleLocator(1.0))
-ax1.grid(True, which='major', color='#7f8c8d', linestyle='-', alpha=0.35)
-ax1.grid(True, which='minor', color='#bdc3c7', linestyle=':', alpha=0.25)
-ax1.legend(loc='lower right', framealpha=0.95, ncol=2)
+ax1.grid(True, alpha=0.3)
+ax1.legend(loc='upper right', framealpha=0.95)
 
-# Panel 2: Distancia Acústica Medida (Posición vs Tiempo)
-max_d = max(distancias_cm) if len(distancias_cm) > 0 else 100.0
+# Panel 2: Posición vs Tiempo
+ax2.axvspan(0, tiempos[n_cal - 1] + 0.5 * PERIODO_WAV, color='#27ae60', alpha=0.12,
+            label=f'Zona de calibración ({n_cal} pulsos quietos)')
+ax2.axhspan(-error_teorico_cm, error_teorico_cm, color='#e67e22', alpha=0.20,
+            label=f'Límite teórico (±{error_teorico_cm:.2f} cm)')
+ax2.axhline(0, color='#7f8c8d', linewidth=1.0)
+ax2.plot(tiempos, distancias_cm, 'o-', color='#2980b9', linewidth=2.0, markersize=7,
+         label='Posición acústica medida [cm]')
 
-ax2.plot(tiempos, distancias_cm, 'o-', color='#2980b9', linewidth=2.0, markersize=7, label='Distancia acústica [cm]')
-ax2.axhline(distancia_final_cm, color='#d35400', linestyle='--', linewidth=1.5, label=f'Distancia final ({distancia_final_cm:.2f} cm)')
-ax2.fill_between(
-    [0, max_x],
-    distancia_final_cm - error_teorico_cm,
-    distancia_final_cm + error_teorico_cm,
-    color='#e67e22',
-    alpha=0.2,
-    label=f'Error teórico (±{error_teorico_cm:.2f} cm)'
-)
-ax2.set_ylim(0, max_d * 1.25 + 10)
+for t, d in zip(tiempos, distancias_cm):
+    ax2.annotate(f"{d:.1f}", xy=(t, d), xytext=(0, 10), textcoords="offset points",
+                 ha='center', fontsize=8.5, fontweight='bold', color='#1a5276',
+                 bbox=dict(boxstyle='round,pad=0.2', facecolor='#ebf5fb', edgecolor='#2980b9', alpha=0.95))
 
-# Evidenciar cada medición con su valor numérico en el Panel 2
-for k, (t, d) in enumerate(zip(tiempos, distancias_cm)):
-    ax2.annotate(
-        f"{d:.2f} cm",
-        xy=(t, d),
-        xytext=(0, 12),
-        textcoords="offset points",
-        ha='center',
-        fontsize=8.5,
-        fontweight='bold',
-        color='#1a5276',
-        bbox=dict(boxstyle='round,pad=0.25', facecolor='#ebf5fb', edgecolor='#2980b9', alpha=0.95)
-    )
-
-ax2.set_title(f"2. Posición Acústica Medida Parlante - Micrófono (0 a {max_x} s)", fontsize=11, fontweight='bold')
-ax2.set_xlabel("Tiempo de grabación [s] ", fontsize=10)
-ax2.set_ylabel("Distancia [cm]", fontsize=10)
+margen = max(10.0, 0.2 * np.max(np.abs(distancias_cm)))
+ax2.set_ylim(min(distancias_cm.min(), -error_teorico_cm) - margen,
+             max(distancias_cm.max(), error_teorico_cm) + margen)
+ax2.set_title("2. Desplazamiento del micrófono respecto al origen (+ = se aleja)",
+              fontsize=11, fontweight='bold')
+ax2.set_xlabel("Tiempo de grabación [s]")
+ax2.set_ylabel("Distancia [cm]")
 ax2.set_xlim(0, max_x)
 ax2.xaxis.set_major_locator(ticker.MultipleLocator(2.0))
 ax2.xaxis.set_minor_locator(ticker.MultipleLocator(1.0))
@@ -209,9 +221,6 @@ ax2.grid(True, which='minor', color='#bdc3c7', linestyle=':', alpha=0.25)
 ax2.legend(loc='upper left', framealpha=0.95)
 
 plt.tight_layout()
-
-# Guardar figura como evidencia gráfica para el usuario e informe
 plt.savefig(ARCHIVO_EVIDENCIA, dpi=200)
 print(f"Evidencia gráfica guardada en: {ARCHIVO_EVIDENCIA}")
-
 plt.show()
